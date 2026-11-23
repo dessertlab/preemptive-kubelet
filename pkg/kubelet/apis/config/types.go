@@ -19,6 +19,7 @@ package config
 import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	logsapi "k8s.io/component-base/logs/api/v1"
 	tracingapi "k8s.io/component-base/tracing/api/v1"
 )
@@ -486,6 +487,42 @@ type KubeletConfiguration struct {
 	// If not specified the default value is ContainerRuntimeEndpoint
 	// +optional
 	ImageServiceEndpoint string
+
+	// Preemptive Kubelet parameters
+	// +optional
+	Criticality CriticalityConfiguration
+	// +optional
+	CriticalityBands CriticalityBandsConfiguration
+	// +optional
+	FIFOSchedulingEnabled bool
+}
+
+// CriticalityConfiguration contains the critical pods parameters.
+type CriticalityConfiguration struct {
+	// +optional
+	LabelKey string
+	// +optional
+	MaxLevel int32
+	// +optional
+	MinLevel int32
+}
+
+// CriticalityBandsConfiguration contains the criticality bands parameters.
+type CriticalityBandsConfiguration struct {
+	// +optional
+	Enabled bool
+	// +optional
+	Stealing bool
+	// +optional
+	MaxConcurrentPodCreations int32
+	// +optional
+	HighBandMinLevel int32
+	// +optional
+	HighBandGuaranteed intstr.IntOrString
+	// +optional
+	MediumBandMinLevel int32
+	// +optional
+	MediumBandGuaranteed intstr.IntOrString
 }
 
 // KubeletAuthorizationMode denotes the authorization mode for the kubelet

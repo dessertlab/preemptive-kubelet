@@ -26,6 +26,7 @@ import (
 	"github.com/spf13/pflag"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -516,4 +517,38 @@ func AddKubeletConfigFlags(mainfs *pflag.FlagSet, c *kubeletconfig.KubeletConfig
 	fs.BoolVar(&c.RegisterNode, "register-node", c.RegisterNode, "Register the node with the apiserver. If --kubeconfig is not provided, this flag is irrelevant, as the Kubelet won't have an apiserver to register with.")
 
 	fs.Var(&utilflag.RegisterWithTaintsVar{Value: &c.RegisterWithTaints}, "register-with-taints", "Register the node with the given list of taints (comma separated \"<key>=<value>:<effect>\"). No-op if register-node is false.")
+
+	// Preemptive Kubelet flags
+	fs.StringVar(&c.Criticality.LabelKey, "criticality-label-key", c.Criticality.LabelKey, "Pod label holding the criticality level.")
+	fs.Int32Var(&c.Criticality.MaxLevel, "criticality-max-level", c.Criticality.MaxLevel, "Highest criticality level (numerically the lowest).")
+	fs.Int32Var(&c.Criticality.MinLevel, "criticality-min-level", c.Criticality.MinLevel, "Lowest criticality level (numerically the highest).")
+	fs.BoolVar(&c.CriticalityBands.Enabled, "criticality-bands-enabled", c.CriticalityBands.Enabled, "Enable criticality bands for pod creations.")
+	fs.BoolVar(&c.CriticalityBands.Stealing, "criticality-bands-stealing", c.CriticalityBands.Stealing, "Allow high and medium criticality bands to use free slots beyond their guaranteed share.")
+	fs.Int32Var(&c.CriticalityBands.MaxConcurrentPodCreations, "criticality-bands-max-concurrent-pod-creations", c.CriticalityBands.MaxConcurrentPodCreations, "Number of pod creations allowed at the same time.")
+	fs.Int32Var(&c.CriticalityBands.HighBandMinLevel, "criticality-bands-high-min-level", c.CriticalityBands.HighBandMinLevel, "Lowest criticality level of the high band.")
+	fs.Var(intOrStringVar{&c.CriticalityBands.HighBandGuaranteed}, "criticality-bands-high-guaranteed", "Slots guaranteed to the high band: a number or a percentage (e.g. 50%).")
+	fs.Int32Var(&c.CriticalityBands.MediumBandMinLevel, "criticality-bands-medium-min-level", c.CriticalityBands.MediumBandMinLevel, "Lowest criticality level of the medium band.")
+	fs.Var(intOrStringVar{&c.CriticalityBands.MediumBandGuaranteed}, "criticality-bands-medium-guaranteed", "Slots guaranteed to the medium band: a number or a percentage (e.g. 25%).")
+	fs.BoolVar(&c.FIFOScheduling, "fifo-scheduling", c.FIFOScheduling, "Enable FIFO scheduling for the kubelet Pod Workers.")
+}
+
+// intOrStringVar adapts an intstr.IntOrString to the pflag.Value interface.
+type intOrStringVar struct {
+	value *intstr.IntOrString
+}
+
+func (v intOrStringVar) String() string {
+	if v.value == nil {
+		return ""
+	}
+	return v.value.String()
+}
+
+func (v intOrStringVar) Set(s string) error {
+	*v.value = intstr.Parse(s)
+	return nil
+}
+
+func (v intOrStringVar) Type() string {
+	return "intOrString"
 }

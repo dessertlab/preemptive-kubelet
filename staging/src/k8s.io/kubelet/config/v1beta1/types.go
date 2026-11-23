@@ -19,6 +19,7 @@ package v1beta1
 import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	logsapi "k8s.io/component-base/logs/api/v1"
 	tracingapi "k8s.io/component-base/tracing/api/v1"
 )
@@ -832,6 +833,42 @@ type KubeletConfiguration struct {
 	// If not specified, the value in containerRuntimeEndpoint is used.
 	// +optional
 	ImageServiceEndpoint string `json:"imageServiceEndpoint,omitempty"`
+
+	// Preemptive Kubelet parameters
+	// +optional
+	Criticality CriticalityConfiguration `json:"criticality,omitempty"`
+	// +optional
+	CriticalityBands CriticalityBandsConfiguration `json:"criticalityBands,omitempty"`
+	// +optional
+	FIFOScheduling bool `json:"fifoScheduling,omitempty"`
+}
+
+// CriticalityConfiguration contains the critical pods parameters.
+type CriticalityConfiguration struct {
+	// +optional
+	LabelKey string `json:"labelKey,omitempty"`
+	// +optional
+	MaxLevel int32 `json:"maxLevel,omitempty"`
+	// +optional
+	MinLevel int32 `json:"minLevel,omitempty"`
+}
+
+// CriticalityBandsConfiguration contains the criticality bands parameters.
+type CriticalityBandsConfiguration struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	Stealing *bool `json:"stealing,omitempty"`
+	// +optional
+	MaxConcurrentPodCreations int32 `json:"maxConcurrentPodCreations,omitempty"`
+	// +optional
+	HighBandMinLevel int32 `json:"highBandMinLevel,omitempty"`
+	// +optional
+	HighBandGuaranteed intstr.IntOrString `json:"highBandGuaranteed,omitempty"`
+	// +optional
+	MediumBandMinLevel int32 `json:"mediumBandMinLevel,omitempty"`
+	// +optional
+	MediumBandGuaranteed intstr.IntOrString `json:"mediumBandGuaranteed,omitempty"`
 }
 
 type KubeletAuthorizationMode string

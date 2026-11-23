@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	sysruntime "runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -203,6 +205,9 @@ const (
 
 	// instrumentationScope is the name of OpenTelemetry instrumentation scope
 	instrumentationScope = "k8s.io/kubernetes/pkg/kubelet"
+
+	// FIFO base priority
+	fifoPriorityBase = 94
 )
 
 var (
@@ -562,6 +567,33 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		nodeStatusMaxImages:            nodeStatusMaxImages,
 		tracer:                         tracer,
 		nodeStartupLatencyTracker:      kubeDeps.NodeStartupLatencyTracker,
+		criticalityLabelKey:       		kubeCfg.Criticality.LabelKey,
+		maxCriticalityLevel:       		int(kubeCfg.Criticality.MaxLevel),
+		minCriticalityLevel:       		int(kubeCfg.Criticality.MinLevel),
+		criticalityBandsEnabled:   		kubeCfg.CriticalityBands.Enabled,
+		criticalityBandsStealing:  		kubeCfg.CriticalityBands.Stealing,
+		maxConcurrentPodCreations: 		int(kubeCfg.CriticalityBands.MaxConcurrentPodCreations),
+		highBandMinLevel:          		int(kubeCfg.CriticalityBands.HighBandMinLevel),
+		mediumBandMinLevel:        		int(kubeCfg.CriticalityBands.MediumBandMinLevel),
+		fifoScheduling:                 kubeCfg.FIFOScheduling,
+	}
+
+	if klet.criticalityBandsEnabled {
+		bands := kubeCfg.CriticalityBands
+		high, err := intstr.GetScaledValueFromIntOrPercent(&bands.HighBandGuaranteed, klet.maxConcurrentPodCreations, false)
+		if err != nil {
+			return nil, fmt.Errorf("invalid criticalityBands.highBandGuaranteed: %w", err)
+		}
+		medium, err := intstr.GetScaledValueFromIntOrPercent(&bands.MediumBandGuaranteed, klet.maxConcurrentPodCreations, false)
+		if err != nil {
+			return nil, fmt.Errorf("invalid criticalityBands.mediumBandGuaranteed: %w", err)
+		}
+		klet.guaranteedSlots = [numBands]int{high, medium, klet.maxConcurrentPodCreations - high - medium}
+		klet.podCreationDoneCh = make(chan types.UID, klet.maxConcurrentPodCreations)
+		klet.creationSlots = &creationSlots{
+			waiting:    map[types.UID]*waitingPod{},
+			inCreation: map[types.UID]criticalityBand{},
+		}
 	}
 
 	if klet.cloud != nil {
@@ -634,6 +666,10 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 
 	klet.reasonCache = NewReasonCache()
 	klet.workQueue = queue.NewBasicWorkQueue(klet.clock)
+	var podFIFOPriority func(*v1.Pod) (int32, bool)
+	if klet.fifoScheduling {
+		podFIFOPriority = klet.getPodFIFOPriority
+	}
 	klet.podWorkers = newPodWorkers(
 		klet,
 		kubeDeps.Recorder,
@@ -641,6 +677,8 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		klet.resyncInterval,
 		backOffPeriod,
 		klet.podCache,
+		klet.podCreationDoneCh,
+		podFIFOPriority,
 	)
 
 	runtime, err := kuberuntime.NewKubeGenericRuntimeManager(
@@ -1324,6 +1362,76 @@ type Kubelet struct {
 
 	// Track node startup latencies
 	nodeStartupLatencyTracker util.NodeStartupLatencyTracker
+
+	// Preemptive Kubelet Parameters
+	// Criticality configuration
+	criticalityLabelKey string
+	maxCriticalityLevel int
+	minCriticalityLevel int
+	// Criticality bands configuration
+	criticalityBandsEnabled   bool
+	criticalityBandsStealing  bool
+	maxConcurrentPodCreations int
+	highBandMinLevel          int
+	mediumBandMinLevel        int
+	guaranteedSlots 		  [numBands]int
+	podCreationDoneCh         chan types.UID
+	creationSlots 			  *creationSlots
+	// FIFO scheduling configuration
+	fIFOScheduling            bool
+}
+
+// criticalityBand identifies a criticality band.
+type criticalityBand int
+
+const (
+	highBand criticalityBand = iota   // 0
+	mediumBand						  // 1
+	lowBand							  // 2
+	numBands						  // 3
+)
+
+// waitingPod is a pod creation waiting for a slot.
+// 1. pod - the pod to be created
+// 2. band - the criticality band of the pod
+// 3. level - the criticality level of the pod, minCriticalityLevel + 1 if it is not a critical pod
+// 4. seq - the sequence number of the pod creation request
+type waitingPod struct {
+	pod   *v1.Pod
+	band  criticalityBand
+	level int
+	seq   uint64
+}
+
+// creationSlots limits the number of concurrent pod creations per criticality band.
+type creationSlots struct {
+	used       [numBands]int                   // creations in progress per band
+	queues     [numBands][]*waitingPod         // waiting pods per band, sorted by (level, seq)
+	waiting    map[types.UID]*waitingPod       // waiting pods by UID
+	inCreation map[types.UID]criticalityBand   // pods holding a slot, by UID
+	nextSeq    uint64                          // next arrival number
+}
+
+// waitingPerBand returns the number of waiting pods per band.
+func (s *creationSlots) waitingPerBand() [numBands]int {
+	var n [numBands]int
+	for band := range s.queues {
+		n[band] = len(s.queues[band])
+	}
+	return n
+}
+
+// releaseCreationSlot releases the creation slot held by the pod.
+// It returns false if the pod was not holding a slot.
+func (kl *Kubelet) releaseCreationSlot(podUID types.UID) bool {
+	s := kl.creationSlots
+	band, ok := s.inCreation[podUID]
+	if !ok {
+		return false
+	}
+	delete(s.inCreation, podUID)
+	s.used[band]--
+	return true
 }
 
 // ListPodStats is delegated to StatsProvider, which implements stats.Provider interface
@@ -2286,6 +2394,9 @@ func (kl *Kubelet) deletePod(pod *v1.Pod) error {
 // rejectPod records an event about the pod with the given reason and message,
 // and updates the pod to the failed phase in the status manager.
 func (kl *Kubelet) rejectPod(pod *v1.Pod, reason, message string) {
+	if kl.creationSlots != nil {
+		kl.releaseCreationSlot(pod.UID)
+	}
 	kl.recorder.Eventf(pod, v1.EventTypeWarning, reason, message)
 	kl.statusManager.SetPodStatus(pod, v1.PodStatus{
 		Phase:   v1.PodFailed,
@@ -2338,24 +2449,6 @@ func (kl *Kubelet) canRunPod(pod *v1.Pod) lifecycle.PodAdmitResult {
 	return lifecycle.PodAdmitResult{Admit: true}
 }
 
-
-// getPodCriticalityLevel returns the criticality level of the pod
-// and a boolean indicating whether the criticality level is either present or valid.
-func (kl *Kubelet) getPodCriticalityLevel(pod *v1.Pod) (int, bool) {
-	if pod == nil {
-		return 0, false
-	}
-	value, exists := pod.Labels[kl.criticalityLabelKey]
-	if !exists {
-		return 0, false
-	}
-	level, err := strconv.Atoi(value)
-	if err != nil || level < kl.maxCriticalityLevel || level > kl.minCriticalityLevel {
-		return 0, false
-	}
-	return level, true
-}
-
 // syncLoop is the main loop for processing changes. It watches for changes from
 // three channels (file, apiserver, and http) and creates a union of them. For
 // any new change seen, will run a sync against desired state and running state. If
@@ -2396,10 +2489,271 @@ func (kl *Kubelet) syncLoop(ctx context.Context, updates <-chan kubetypes.PodUpd
 		duration = base
 
 		kl.syncLoopMonitor.Store(kl.clock.Now())
-		if !kl.syncLoopIteration(ctx, updates, handler, syncTicker.C, housekeepingTicker.C, plegCh) {
+		if !kl.syncLoopIteration(ctx, updates, handler, syncTicker.C, housekeepingTicker.C, plegCh, kl.podCreationDoneCh) {
 			break
 		}
 		kl.syncLoopMonitor.Store(kl.clock.Now())
+	}
+}
+
+// getPodCriticalityLevel returns the criticality level of the pod
+// and a boolean indicating whether the criticality level is present and valid.
+func (kl *Kubelet) getPodCriticalityLevel(pod *v1.Pod) (int, bool) {
+	if pod == nil {
+		return 0, false
+	}
+	value, exists := pod.Labels[kl.criticalityLabelKey]
+	if !exists {
+		return 0, false
+	}
+	level, err := strconv.Atoi(value)
+	if err != nil || level < kl.maxCriticalityLevel || level > kl.minCriticalityLevel {
+		return 0, false
+	}
+	return level, true
+}
+
+// getPodFIFOPriority returns the SCHED_FIFO priority of the pod, derived from its
+// criticality level, and false if the pod has no valid criticality level.
+// A higher critical pod (lower level) gets a higher FIFO priority.
+func (kl *Kubelet) getPodFIFOPriority(pod *v1.Pod) (int32, bool) {
+	level, ok := kl.getPodCriticalityLevel(pod)
+	if !ok {
+		klog.V(4).InfoS("Pod has no valid criticality level, FIFO scheduling not applied", "pod", klog.KObj(pod), "podUID", pod.UID)
+		return 0, false
+	}
+	return int32(fifoPriorityBase - level), true
+}
+
+// getCriticalityBand returns the band of a pod given its criticality level.
+// Pods without a valid level belong to the low priority band.
+func (kl *Kubelet) getCriticalityBand(level int, ok bool) criticalityBand {
+	if !ok {
+		return lowBand
+	}
+	if level <= kl.highBandMinLevel {
+		return highBand
+	}
+	if level <= kl.mediumBandMinLevel {
+		return mediumBand
+	}
+	return lowBand
+}
+
+// Log utility function to convert a criticality band to a string.
+func (b criticalityBand) String() string {
+	switch b {
+	case highBand:
+		return "high"
+	case mediumBand:
+		return "medium"
+	default:
+		return "low"
+	}
+}
+
+// insertWaitingPod inserts the entry in the queue of its band, keeping the
+// queue sorted by criticality level and then by arrival order.
+func (kl *Kubelet) insertWaitingPod(w *waitingPod) {
+	s := kl.creationSlots
+	q := s.queues[w.band]
+	i := sort.Search(len(q), func(i int) bool {
+		return q[i].level > w.level || (q[i].level == w.level && q[i].seq > w.seq)
+	})
+	q = append(q, nil)
+	copy(q[i+1:], q[i:])
+	q[i] = w
+	s.queues[w.band] = q
+	s.waiting[w.pod.UID] = w
+}
+
+// removeWaitingPod removes the pod from its queue and from the waiting pods,
+// and returns its entry. It returns nil if the pod is not waiting.
+func (kl *Kubelet) removeWaitingPod(podUID types.UID) *waitingPod {
+	s := kl.creationSlots
+	w, ok := s.waiting[podUID]
+	if !ok {
+		return nil
+	}
+	delete(s.waiting, podUID)
+	q := s.queues[w.band]
+	for i := range q {
+		if q[i] == w {
+			s.queues[w.band] = append(q[:i], q[i+1:]...)
+			break
+		}
+	}
+	return w
+}
+
+// enqueueWaitingPod creates the waiting entry of the pod and inserts it in the
+// queue of its band.
+func (kl *Kubelet) enqueueWaitingPod(pod *v1.Pod, band criticalityBand, level int) {
+	s := kl.creationSlots
+	if _, exists := s.waiting[pod.UID]; exists {
+		return
+	}
+	if _, exists := s.inCreation[pod.UID]; exists {
+		return
+	}
+	w := &waitingPod{pod: pod, band: band, level: level, seq: s.nextSeq}
+	s.nextSeq++
+	kl.insertWaitingPod(w)
+}
+
+// bandCreationLimit returns the maximum number of concurrent creations of the band.
+func (kl *Kubelet) bandCreationLimit(band criticalityBand) int {
+	g := kl.guaranteedSlots
+	if !kl.criticalityBandsStealing {
+		return g[band]
+	}
+	s := kl.creationSlots
+	reserved := func(b criticalityBand) int {
+		return min(g[b], s.used[b]+len(s.queues[b]))
+	}
+	switch band {
+	case highBand:
+		return kl.maxConcurrentPodCreations - reserved(mediumBand) - reserved(lowBand)
+	case mediumBand:
+		return kl.maxConcurrentPodCreations - g[highBand] - reserved(lowBand)
+	default:
+		return g[lowBand]
+	}
+}
+
+// canStartCreation reports whether a pod of the band can start its creation now.
+func (kl *Kubelet) canStartCreation(band criticalityBand) bool {
+	s := kl.creationSlots
+	total := 0
+	for _, n := range s.used {
+		total += n
+	}
+	if total >= kl.maxConcurrentPodCreations {
+		return false
+	}
+	return s.used[band] < kl.bandCreationLimit(band)
+}
+
+// startWaitingPods starts the creation of waiting pods, from the high band to
+// the low band, as long as the band rules allow it.
+func (kl *Kubelet) startWaitingPods(handler SyncHandler) {
+	s := kl.creationSlots
+	for band := highBand; band < numBands; band++ {
+		for len(s.queues[band]) > 0 && kl.canStartCreation(band) {
+			w := s.queues[band][0]
+			s.queues[band] = s.queues[band][1:]
+			delete(s.waiting, w.pod.UID)
+			s.used[band]++
+			s.inCreation[w.pod.UID] = band
+			handler.HandlePodAdditions([]*v1.Pod{w.pod})
+		}
+	}
+}
+
+// splitWaitingPods splits the pods into those waiting for a creation slot and
+// all the others.
+func (kl *Kubelet) splitWaitingPods(pods []*v1.Pod) (waiting, others []*v1.Pod) {
+	for _, pod := range pods {
+		if _, ok := kl.creationSlots.waiting[pod.UID]; ok {
+			waiting = append(waiting, pod)
+		} else {
+			others = append(others, pod)
+		}
+	}
+	return waiting, others
+}
+
+// handleCriticalPodAdditions dispatches the added pods by criticality.
+// Static pods, mirror pods and pods that are no longer pending (e.g. already
+// running when the kubelet restarts) bypass the creation slots and are sent to
+// the handler directly. The other pods are queued in their band, ordered by
+// criticality level and arrival order, and started according to the band rules.
+func (kl *Kubelet) handleCriticalPodAdditions(pods []*v1.Pod, handler SyncHandler) {
+	var bypass []*v1.Pod
+	for _, pod := range pods {
+		if kubetypes.IsStaticPod(pod) || kubetypes.IsMirrorPod(pod) || pod.Status.Phase != v1.PodPending {
+			klog.V(4).InfoS("Pod bypasses creation slots", "pod", klog.KObj(pod), "podUID", pod.UID, "phase", pod.Status.Phase)
+			bypass = append(bypass, pod)
+			continue
+		}
+		level, ok := kl.getPodCriticalityLevel(pod)
+		band := kl.getCriticalityBand(level, ok)
+		klog.V(4).InfoS("Pod assigned to criticality band", "pod", klog.KObj(pod), "podUID", pod.UID, "band", band, "level", level, "validLevel", ok)
+		if !ok {
+			level = kl.minCriticalityLevel + 1
+		}
+		kl.enqueueWaitingPod(pod, band, level)
+	}
+	if len(bypass) > 0 {
+		handler.HandlePodAdditions(bypass)
+	}
+	klog.V(4).InfoS("SyncLoop (ADD): pods enqueued",
+		"used", kl.creationSlots.used,
+		"waiting", kl.creationSlots.waitingPerBand(),
+		"inCreation", len(kl.creationSlots.inCreation))
+	kl.startWaitingPods(handler)
+	klog.V(4).InfoS("SyncLoop (ADD): waiting pods started, if any",
+		"used", kl.creationSlots.used,
+		"waiting", kl.creationSlots.waitingPerBand(),
+		"inCreation", len(kl.creationSlots.inCreation))
+}
+
+// handleCriticalPodUpdates updates the waiting pods in their queues, moving them
+// if their criticality level changed, and sends the other pods to the handler.
+func (kl *Kubelet) handleCriticalPodUpdates(pods []*v1.Pod, handler SyncHandler) {
+	waiting, others := kl.splitWaitingPods(pods)
+	for _, pod := range waiting {
+		level, ok := kl.getPodCriticalityLevel(pod)
+		band := kl.getCriticalityBand(level, ok)
+		if !ok {
+			level = kl.minCriticalityLevel + 1
+		}
+		w := kl.removeWaitingPod(pod.UID)
+		klog.V(4).InfoS("Waiting pod updated", "pod", klog.KObj(pod), "podUID", pod.UID, "oldBand", w.band, "oldLevel", w.level, "band", band, "level", level)
+		w.pod = pod
+		w.band = band
+		w.level = level
+		kl.insertWaitingPod(w)
+	}
+	if len(others) > 0 {
+		handler.HandlePodUpdates(others)
+	}
+	kl.startWaitingPods(handler)
+}
+
+// handleCriticalPodDeletes removes the waiting pods from their queues and sends
+// all the pods to the handler, so that graceful deletion can complete.
+func (kl *Kubelet) handleCriticalPodDeletes(pods []*v1.Pod, handler SyncHandler) {
+	waiting, _ := kl.splitWaitingPods(pods)
+	for _, pod := range waiting {
+		kl.removeWaitingPod(pod.UID)
+		klog.V(4).InfoS("Waiting pod deleted before creation", "pod", klog.KObj(pod), "podUID", pod.UID)
+	}
+	handler.HandlePodUpdates(pods)
+}
+
+// handleCriticalPodRemoves removes the waiting pods from their queues and sends
+// the other pods to the handler.
+func (kl *Kubelet) handleCriticalPodRemoves(pods []*v1.Pod, handler SyncHandler) {
+	waiting, others := kl.splitWaitingPods(pods)
+	for _, pod := range waiting {
+		kl.removeWaitingPod(pod.UID)
+		klog.V(4).InfoS("Waiting pod removed before creation", "pod", klog.KObj(pod), "podUID", pod.UID)
+	}
+	if len(others) > 0 {
+		handler.HandlePodRemoves(others)
+	}
+}
+
+// handleCriticalPodReconcile refreshes the waiting pods in their queues and
+// sends the other pods to the handler.
+func (kl *Kubelet) handleCriticalPodReconcile(pods []*v1.Pod, handler SyncHandler) {
+	waiting, others := kl.splitWaitingPods(pods)
+	for _, pod := range waiting {
+		kl.creationSlots.waiting[pod.UID].pod = pod
+	}
+	if len(others) > 0 {
+		handler.HandlePodReconcile(others)
 	}
 }
 
@@ -2412,6 +2766,7 @@ func (kl *Kubelet) syncLoop(ctx context.Context, updates <-chan kubetypes.PodUpd
 // 3.  syncCh:         a channel to read periodic sync events from
 // 4.  housekeepingCh: a channel to read housekeeping events from
 // 5.  plegCh:         a channel to read PLEG updates from
+// 6.  podDoneCh:      a channel to read pod creation completion events from
 //
 // Events are also read from the kubelet liveness manager's update channel.
 //
@@ -2435,8 +2790,9 @@ func (kl *Kubelet) syncLoop(ctx context.Context, updates <-chan kubetypes.PodUpd
 //   - housekeepingCh: trigger cleanup of pods
 //   - health manager: sync pods that have failed or in which one or more
 //     containers have failed health checks
+//   - podDoneCh: release the creation slot of the pod and dispatch waiting pods
 func (kl *Kubelet) syncLoopIteration(ctx context.Context, configCh <-chan kubetypes.PodUpdate, handler SyncHandler,
-	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent) bool {
+	syncCh <-chan time.Time, housekeepingCh <-chan time.Time, plegCh <-chan *pleg.PodLifecycleEvent, podDoneCh <-chan types.UID) bool {
 	select {
 	case u, open := <-configCh:
 		// Update from a config source; dispatch it to the right handler
@@ -2453,20 +2809,40 @@ func (kl *Kubelet) syncLoopIteration(ctx context.Context, configCh <-chan kubety
 			// ADD as if they are new pods. These pods will then go through the
 			// admission process and *may* be rejected. This can be resolved
 			// once we have checkpointing.
-			handler.HandlePodAdditions(u.Pods)
+			if kl.creationSlots == nil {
+				handler.HandlePodAdditions(u.Pods)
+			} else {
+				kl.handleCriticalPodAdditions(u.Pods, handler)
+			}
 		case kubetypes.UPDATE:
 			klog.V(2).InfoS("SyncLoop UPDATE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
-			handler.HandlePodUpdates(u.Pods)
+			if kl.creationSlots == nil {
+				handler.HandlePodUpdates(u.Pods)
+			} else {
+				kl.handleCriticalPodUpdates(u.Pods, handler)
+			}
 		case kubetypes.REMOVE:
 			klog.V(2).InfoS("SyncLoop REMOVE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
-			handler.HandlePodRemoves(u.Pods)
+			if kl.creationSlots == nil {
+				handler.HandlePodRemoves(u.Pods)
+			} else {
+				kl.handleCriticalPodRemoves(u.Pods, handler)
+			}
 		case kubetypes.RECONCILE:
 			klog.V(4).InfoS("SyncLoop RECONCILE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
-			handler.HandlePodReconcile(u.Pods)
+			if kl.creationSlots == nil {
+				handler.HandlePodReconcile(u.Pods)
+			} else {
+				kl.handleCriticalPodReconcile(u.Pods, handler)
+			}
 		case kubetypes.DELETE:
 			klog.V(2).InfoS("SyncLoop DELETE", "source", u.Source, "pods", klog.KObjSlice(u.Pods))
 			// DELETE is treated as a UPDATE because of graceful deletion.
-			handler.HandlePodUpdates(u.Pods)
+			if kl.creationSlots == nil {
+				handler.HandlePodUpdates(u.Pods)
+			} else {
+				kl.handleCriticalPodDeletes(u.Pods, handler)
+			}
 		case kubetypes.SET:
 			// TODO: Do we want to support this?
 			klog.ErrorS(nil, "Kubelet does not support snapshot update")
@@ -2539,6 +2915,21 @@ func (kl *Kubelet) syncLoopIteration(ctx context.Context, configCh <-chan kubety
 				klog.ErrorS(fmt.Errorf("housekeeping took too long"), "Housekeeping took longer than expected", "expected", housekeepingWarningDuration, "actual", duration.Round(time.Millisecond))
 			}
 			klog.V(4).InfoS("SyncLoop (housekeeping) end", "duration", duration.Round(time.Millisecond))
+		}
+	case podUID := <-podDoneCh:
+		// Pod creation has ended: release its slot and start waiting pods.
+		if kl.releaseCreationSlot(podUID) {
+			klog.V(4).InfoS("SyncLoop (podDoneCh): pod creation done", "podUID", podUID,
+				"used", kl.creationSlots.used,
+				"waiting", kl.creationSlots.waitingPerBand(),
+				"inCreation", len(kl.creationSlots.inCreation))
+			kl.startWaitingPods(handler)
+			klog.V(4).InfoS("SyncLoop (podDoneCh): waiting pods started, if any", "podUID", podUID,
+				"used", kl.creationSlots.used,
+				"waiting", kl.creationSlots.waitingPerBand(),
+				"inCreation", len(kl.creationSlots.inCreation))
+		} else {
+			klog.V(4).InfoS("SyncLoop (podDoneCh): pod was not holding a creation slot", "podUID", podUID)
 		}
 	}
 	return true

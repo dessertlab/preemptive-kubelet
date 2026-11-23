@@ -475,6 +475,21 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
 		*out = new(bool)
 		**out = **in
 	}
+	out.Criticality = in.Criticality
+	in.CriticalityBands.DeepCopyInto(&out.CriticalityBands)
+	return
+}
+
+// DeepCopyInto is a deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *CriticalityBandsConfiguration) DeepCopyInto(out *CriticalityBandsConfiguration) {
+	*out = *in
+	if in.Stealing != nil {
+		in, out := &in.Stealing, &out.Stealing
+		*out = new(bool)
+		**out = **in
+	}
+	out.HighBandGuaranteed = in.HighBandGuaranteed
+	out.MediumBandGuaranteed = in.MediumBandGuaranteed
 	return
 }
 

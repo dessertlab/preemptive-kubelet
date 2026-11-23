@@ -519,6 +519,19 @@ func autoConvert_v1beta1_KubeletConfiguration_To_config_KubeletConfiguration(in 
 	}
 	out.ContainerRuntimeEndpoint = in.ContainerRuntimeEndpoint
 	out.ImageServiceEndpoint = in.ImageServiceEndpoint
+	out.Criticality.LabelKey = in.Criticality.LabelKey
+	out.Criticality.MaxLevel = in.Criticality.MaxLevel
+	out.Criticality.MinLevel = in.Criticality.MinLevel
+	out.CriticalityBands.Enabled = in.CriticalityBands.Enabled
+	if err := v1.Convert_Pointer_bool_To_bool(&in.CriticalityBands.Stealing, &out.CriticalityBands.Stealing, s); err != nil {
+		return err
+	}
+	out.CriticalityBands.MaxConcurrentPodCreations = in.CriticalityBands.MaxConcurrentPodCreations
+	out.CriticalityBands.HighBandMinLevel = in.CriticalityBands.HighBandMinLevel
+	out.CriticalityBands.HighBandGuaranteed = in.CriticalityBands.HighBandGuaranteed
+	out.CriticalityBands.MediumBandMinLevel = in.CriticalityBands.MediumBandMinLevel
+	out.CriticalityBands.MediumBandGuaranteed = in.CriticalityBands.MediumBandGuaranteed
+	out.FIFOScheduling = in.FIFOScheduling
 	return nil
 }
 
@@ -705,6 +718,19 @@ func autoConvert_config_KubeletConfiguration_To_v1beta1_KubeletConfiguration(in 
 	}
 	out.ContainerRuntimeEndpoint = in.ContainerRuntimeEndpoint
 	out.ImageServiceEndpoint = in.ImageServiceEndpoint
+	out.Criticality.LabelKey = in.Criticality.LabelKey
+	out.Criticality.MaxLevel = in.Criticality.MaxLevel
+	out.Criticality.MinLevel = in.Criticality.MinLevel
+	out.CriticalityBands.Enabled = in.CriticalityBands.Enabled
+	if err := v1.Convert_bool_To_Pointer_bool(&in.CriticalityBands.Stealing, &out.CriticalityBands.Stealing, s); err != nil {
+		return err
+	}
+	out.CriticalityBands.MaxConcurrentPodCreations = in.CriticalityBands.MaxConcurrentPodCreations
+	out.CriticalityBands.HighBandMinLevel = in.CriticalityBands.HighBandMinLevel
+	out.CriticalityBands.HighBandGuaranteed = in.CriticalityBands.HighBandGuaranteed
+	out.CriticalityBands.MediumBandMinLevel = in.CriticalityBands.MediumBandMinLevel
+	out.CriticalityBands.MediumBandGuaranteed = in.CriticalityBands.MediumBandGuaranteed
+	out.FIFOScheduling = in.FIFOScheduling
 	return nil
 }
 

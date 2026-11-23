@@ -34,6 +34,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
+	"k8s.io/kubernetes/pkg/kubelet/rtsched"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/queue"
 	"k8s.io/utils/clock"
@@ -400,6 +401,10 @@ type podSyncStatus struct {
 	// invoking the terminating methods if the pod is deleted or orphaned before
 	// it has been started.
 	observedRuntime bool
+	// creationSignaled is true if the pod worker has signaled the completion 
+	// of the first work (sync or termination). The signal is sent
+	// only once per pod.
+	creationSignaled bool
 }
 
 func (s *podSyncStatus) IsWorking() bool              { return s.working }
@@ -595,6 +600,14 @@ type podWorkers struct {
 
 	// clock is used for testing timing
 	clock clock.PassiveClock
+
+	// podCreationDoneCh is used to notify when a pod creation is complete.
+	// NIL when criticality bands are disabled.
+	podCreationDoneCh chan<- types.UID 
+
+	// podFIFOPriority returns the SCHED_FIFO priority of a pod.
+	// Nil when FIFO scheduling is disabled.
+	podFIFOPriority func(*v1.Pod) (int32, bool)
 }
 
 func newPodWorkers(
@@ -603,6 +616,8 @@ func newPodWorkers(
 	workQueue queue.WorkQueue,
 	resyncInterval, backOffPeriod time.Duration,
 	podCache kubecontainer.Cache,
+	podCreationDoneCh chan<- types.UID,
+	podFIFOPriority func(*v1.Pod) (int32, bool),
 ) PodWorkers {
 	return &podWorkers{
 		podSyncStatuses:                    map[types.UID]*podSyncStatus{},
@@ -616,6 +631,8 @@ func newPodWorkers(
 		backOffPeriod:                      backOffPeriod,
 		podCache:                           podCache,
 		clock:                              clock.RealClock{},
+		podCreationDoneCh:                  podCreationDoneCh,
+		podFIFOPriority:                    podFIFOPriority,
 	}
 }
 
@@ -1195,6 +1212,35 @@ func podUIDAndRefForUpdate(update UpdatePodOptions) (types.UID, klog.ObjectRef) 
 	return update.Pod.UID, klog.KObj(update.Pod)
 }
 
+// signalCreationDone sends the pod UID on podCreationDoneCh the first time it is
+// called for the pod. It does nothing if criticality bands are disabled.
+// The send happens without holding podLock.
+func (p *podWorkers) signalCreationDone(podUID types.UID) {
+	if p.podCreationDoneCh == nil {
+		return
+	}
+	p.podLock.Lock()
+	status, ok := p.podSyncStatuses[podUID]
+	if !ok || status.creationSignaled {
+		p.podLock.Unlock()
+		return
+	}
+	status.creationSignaled = true
+	p.podLock.Unlock()
+
+	p.podCreationDoneCh <- podUID
+}
+
+// getFirstSyncFIFOPriority returns the SCHED_FIFO priority for the SyncPod of
+// the pod, and false if the SyncPod must run with the default policy: FIFO
+// scheduling disabled, not the first SyncPod, or no valid criticality level.
+func (p *podWorkers) getFirstSyncFIFOPriority(firstSync bool, pod *v1.Pod) (int32, bool) {
+	if p.podFIFOPriority == nil || !firstSync {
+		return 0, false
+	}
+	return p.podFIFOPriority(pod)
+}
+
 // podWorkerLoop manages sequential state updates to a pod in a goroutine, exiting once the final
 // state is reached. The loop is responsible for driving the pod through four main phases:
 //
@@ -1210,6 +1256,7 @@ func podUIDAndRefForUpdate(update UpdatePodOptions) (types.UID, klog.ObjectRef) 
 // queued immediately and no kubelet action is required.
 func (p *podWorkers) podWorkerLoop(podUID types.UID, podUpdates <-chan struct{}) {
 	var lastSyncTime time.Time
+	firstSync := true
 	for range podUpdates {
 		ctx, update, canStart, canEverStart, ok := p.startPodSync(podUID)
 		// If we had no update waiting, it means someone initialized the channel without filling out pendingUpdate.
@@ -1218,6 +1265,7 @@ func (p *podWorkers) podWorkerLoop(podUID types.UID, podUpdates <-chan struct{})
 		}
 		// If the pod was terminated prior to the pod being allowed to start, we exit the loop.
 		if !canEverStart {
+			p.signalCreationDone(podUID)
 			return
 		}
 		// If the pod is not yet ready to start, continue and wait for more updates.
@@ -1280,13 +1328,24 @@ func (p *podWorkers) podWorkerLoop(podUID types.UID, podUpdates <-chan struct{})
 				}
 
 			default:
-				isTerminal, err = p.podSyncer.SyncPod(ctx, update.Options.UpdateType, update.Options.Pod, update.Options.MirrorPod, status)
+				syncPod := func() {
+					isTerminal, err = p.podSyncer.SyncPod(ctx, update.Options.UpdateType, update.Options.Pod, update.Options.MirrorPod, status)
+				}
+				// The first SyncPod of a pod with a valid criticality level runs
+				// under SCHED_FIFO; later syncs run with the default policy.
+				if priority, ok := p.getFirstSyncFIFOPriority(firstSync, update.Options.Pod); ok {
+					rtsched.RunWithFIFO(priority, syncPod)
+				} else {
+					syncPod()
+				}
+				firstSync = false
 			}
 
 			lastSyncTime = p.clock.Now()
 			return err
 		}()
 
+		p.signalCreationDone(podUID)
 		var phaseTransition bool
 		switch {
 		case err == context.Canceled:

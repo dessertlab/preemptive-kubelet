@@ -20,6 +20,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
 
@@ -273,5 +274,33 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	}
 	if obj.ContainerRuntimeEndpoint == "" {
 		obj.ContainerRuntimeEndpoint = "unix:///run/containerd/containerd.sock"
+	}
+	// Preemptive Kubelet default parameters
+	if obj.Criticality.LabelKey == "" {
+		obj.Criticality.LabelKey = "criticality"
+	}
+	if obj.Criticality.MaxLevel == 0 {
+		obj.Criticality.MaxLevel = 1
+	}
+	if obj.Criticality.MinLevel == 0 {
+		obj.Criticality.MinLevel = 80
+	}
+	if obj.CriticalityBands.Stealing == nil {
+		obj.CriticalityBands.Stealing = utilpointer.Bool(true)
+	}
+	if obj.CriticalityBands.MaxConcurrentPodCreations == 0 {
+		obj.CriticalityBands.MaxConcurrentPodCreations = 8
+	}
+	if obj.CriticalityBands.HighBandMinLevel == 0 {
+		obj.CriticalityBands.HighBandMinLevel = 10
+	}
+	if obj.CriticalityBands.HighBandGuaranteed == (intstr.IntOrString{}) {
+		obj.CriticalityBands.HighBandGuaranteed = intstr.FromString("50%")
+	}
+	if obj.CriticalityBands.MediumBandMinLevel == 0 {
+		obj.CriticalityBands.MediumBandMinLevel = 30
+	}
+	if obj.CriticalityBands.MediumBandGuaranteed == (intstr.IntOrString{}) {
+		obj.CriticalityBands.MediumBandGuaranteed = intstr.FromString("25%")
 	}
 }

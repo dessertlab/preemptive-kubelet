@@ -21,6 +21,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -277,6 +278,43 @@ func ValidateKubeletConfiguration(kc *kubeletconfig.KubeletConfiguration, featur
 	if kc.EnableSystemLogQuery && !kc.EnableSystemLogHandler {
 		allErrors = append(allErrors,
 			fmt.Errorf("invalid configuration: enableSystemLogHandler is required for enableSystemLogQuery"))
+	}
+
+	// Preemptive Kubelet parameters
+	for _, msg := range utilvalidation.IsQualifiedName(kc.Criticality.LabelKey) {
+		allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticality.labelKey %q: %s", kc.Criticality.LabelKey, msg))
+	}
+	if kc.Criticality.MaxLevel < 1 {
+		allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticality.maxLevel (%d) must be at least 1", kc.Criticality.MaxLevel))
+	}
+	if kc.Criticality.MinLevel < kc.Criticality.MaxLevel {
+		allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticality.minLevel (%d) must not be lower than criticality.maxLevel (%d)", kc.Criticality.MinLevel, kc.Criticality.MaxLevel))
+	}
+	if kc.CriticalityBands.Enabled {
+		bands := kc.CriticalityBands
+		if bands.MaxConcurrentPodCreations < 3 {
+			allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticalityBands.maxConcurrentPodCreations (%d) must be at least 3, one slot per band", bands.MaxConcurrentPodCreations))
+		}
+		if bands.HighBandMinLevel < kc.Criticality.MaxLevel || bands.HighBandMinLevel >= bands.MediumBandMinLevel || bands.MediumBandMinLevel > kc.Criticality.MinLevel {
+			allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticality levels must satisfy criticality.maxLevel (%d) <= criticalityBands.highBandMinLevel (%d) < criticalityBands.mediumBandMinLevel (%d) <= criticality.minLevel (%d)",
+				kc.Criticality.MaxLevel, bands.HighBandMinLevel, bands.MediumBandMinLevel, kc.Criticality.MinLevel))
+		}
+		total := int(bands.MaxConcurrentPodCreations)
+		high, errHigh := intstr.GetScaledValueFromIntOrPercent(&bands.HighBandGuaranteed, total, false)
+		if errHigh != nil {
+			allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticalityBands.highBandGuaranteed (%s): %v", bands.HighBandGuaranteed.String(), errHigh))
+		} else if high < 1 {
+			allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticalityBands.highBandGuaranteed (%s) must give at least 1 slot out of %d", bands.HighBandGuaranteed.String(), total))
+		}
+		medium, errMedium := intstr.GetScaledValueFromIntOrPercent(&bands.MediumBandGuaranteed, total, false)
+		if errMedium != nil {
+			allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticalityBands.mediumBandGuaranteed (%s): %v", bands.MediumBandGuaranteed.String(), errMedium))
+		} else if medium < 1 {
+			allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticalityBands.mediumBandGuaranteed (%s) must give at least 1 slot out of %d", bands.MediumBandGuaranteed.String(), total))
+		}
+		if errHigh == nil && errMedium == nil && high+medium > total-1 {
+			allErrors = append(allErrors, fmt.Errorf("invalid configuration: criticalityBands guaranteed slots (high %d + medium %d) must leave at least 1 slot out of %d to the low band", high, medium, total))
+		}
 	}
 
 	return utilerrors.NewAggregate(allErrors)
