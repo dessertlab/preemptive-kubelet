@@ -494,7 +494,7 @@ type KubeletConfiguration struct {
 	// +optional
 	CriticalityBands CriticalityBandsConfiguration
 	// +optional
-	FIFOSchedulingEnabled bool
+	FIFOScheduling bool
 }
 
 // CriticalityConfiguration contains the critical pods parameters.
