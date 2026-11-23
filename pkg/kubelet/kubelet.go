@@ -1378,7 +1378,7 @@ type Kubelet struct {
 	podCreationDoneCh         chan types.UID
 	creationSlots 			  *creationSlots
 	// FIFO scheduling configuration
-	fIFOScheduling            bool
+	fifoScheduling            bool
 }
 
 // criticalityBand identifies a criticality band.
